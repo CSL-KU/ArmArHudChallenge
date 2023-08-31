@@ -1,0 +1,1473 @@
+diff -ruN orig_src/include/linux/cgroup_subsys.h new_src/include/linux/cgroup_subsys.h
+--- orig_src/include/linux/cgroup_subsys.h	2023-01-04 10:20:07.457538978 -0600
++++ new_src/include/linux/cgroup_subsys.h	2023-01-10 20:13:47.244269366 -0600
+@@ -75,3 +75,7 @@
+ /*
+  * DO NOT ADD ANY SUBSYSTEM WITHOUT EXPLICIT ACKS FROM CGROUP MAINTAINERS.
+  */
++
++#if IS_ENABLED(CONFIG_CGROUP_PALLOC)
++SUBSYS(palloc)
++#endif
+diff -ruN orig_src/include/linux/mmzone.h new_src/include/linux/mmzone.h
+--- orig_src/include/linux/mmzone.h	2023-01-04 10:20:09.397556356 -0600
++++ new_src/include/linux/mmzone.h	2023-01-10 20:13:55.491868542 -0600
+@@ -83,6 +83,14 @@
+ 	return is_migrate_cma(mt) || mt == MIGRATE_MOVABLE;
+ }
+ 
++#ifdef CONFIG_CGROUP_PALLOC
++/* Determine the number of bins according to the bits required for
++   each component of the address */
++#define MAX_PALLOC_BITS 8
++#define MAX_PALLOC_BINS (1 << MAX_PALLOC_BITS)
++#define COLOR_BITMAP(name) DECLARE_BITMAP(name, MAX_PALLOC_BINS)
++#endif
++
+ #define for_each_migratetype_order(order, type) \
+ 	for (order = 0; order < MAX_ORDER; order++) \
+ 		for (type = 0; type < MIGRATE_TYPES; type++)
+@@ -607,6 +615,14 @@
+ 	/* free areas of different sizes */
+ 	struct free_area	free_area[MAX_ORDER];
+ 
++#ifdef CONFIG_CGROUP_PALLOC
++	/*
++	 * Color page cache for movable type free pages of order-0
++	 */
++	struct list_head	color_list[MAX_PALLOC_BINS];
++	COLOR_BITMAP(color_bitmap);
++#endif
++
+ 	/* zone flags, see below */
+ 	unsigned long		flags;
+ 
+diff -ruN orig_src/include/linux/palloc.h new_src/include/linux/palloc.h
+--- orig_src/include/linux/palloc.h	1969-12-31 18:00:00.000000000 -0600
++++ new_src/include/linux/palloc.h	2023-01-10 20:14:04.951420905 -0600
+@@ -0,0 +1,33 @@
++#ifndef _LINUX_PALLOC_H
++#define _LINUX_PALLOC_H
++
++/*
++ * kernel/palloc.h
++ *
++ * Physical Memory Aware Allocator
++ */
++
++#include <linux/types.h>
++#include <linux/cgroup.h>
++#include <linux/kernel.h>
++#include <linux/mm.h>
++
++#ifdef CONFIG_CGROUP_PALLOC
++
++struct palloc {
++	struct cgroup_subsys_state css;
++	COLOR_BITMAP(cmap);
++};
++
++/* Retrieve the palloc group corresponding to this cgroup container */
++struct palloc *cgroup_ph(struct cgroup *cgrp);
++
++/* Retrieve the palloc group corresponding to this subsys */
++struct palloc *ph_from_subsys(struct cgroup_subsys_state *subsys);
++
++/* Return number of palloc bins */
++int palloc_bins(void);
++
++#endif /* CONFIG_CGROUP_PALLOC */
++
++#endif /* _LINUX_PALLOC_H */
+diff -ruN orig_src/include/linux/sched.h new_src/include/linux/sched.h
+--- orig_src/include/linux/sched.h	2023-01-04 10:20:10.409565096 -0600
++++ new_src/include/linux/sched.h	2023-01-10 20:13:15.293921306 -0600
+@@ -803,6 +803,9 @@
+ 	struct uclamp_se		uclamp[UCLAMP_CNT];
+ #endif
+ 
++	/* Throttling related fields */
++	int corun_threshold_events;
++
+ #ifdef CONFIG_PREEMPT_NOTIFIERS
+ 	/* List of struct preempt_notifier: */
+ 	struct hlist_head		preempt_notifiers;
+diff -ruN orig_src/include/linux/syscalls.h new_src/include/linux/syscalls.h
+--- orig_src/include/linux/syscalls.h	2023-01-04 10:20:12.373581492 -0600
++++ new_src/include/linux/syscalls.h	2023-01-10 20:11:47.088607300 -0600
+@@ -988,6 +988,7 @@
+ 				      const struct iovec __user *rvec,
+ 				      unsigned long riovcnt,
+ 				      unsigned long flags);
++asmlinkage long sys_bwlock(pid_t pid, int cte);
+ asmlinkage long sys_kcmp(pid_t pid1, pid_t pid2, int type,
+ 			 unsigned long idx1, unsigned long idx2);
+ asmlinkage long sys_finit_module(int fd, const char __user *uargs, int flags);
+diff -ruN orig_src/include/uapi/asm-generic/unistd.h new_src/include/uapi/asm-generic/unistd.h
+--- orig_src/include/uapi/asm-generic/unistd.h	2023-01-04 10:20:14.157595634 -0600
++++ new_src/include/uapi/asm-generic/unistd.h	2023-01-10 20:12:05.732489342 -0600
+@@ -702,6 +702,9 @@
+  */
+ #define __NR_arch_specific_syscall 244
+ 
++#define __NR_bwlock 255
++__SYSCALL(__NR_bwlock, sys_bwlock)
++
+ #if defined(__ARCH_WANT_TIME32_SYSCALLS) || __BITS_PER_LONG != 32
+ #define __NR_wait4 260
+ __SC_COMP(__NR_wait4, sys_wait4, compat_sys_wait4)
+diff -ruN orig_src/init/Kconfig new_src/init/Kconfig
+--- orig_src/init/Kconfig	2023-01-04 10:20:16.421612604 -0600
++++ new_src/init/Kconfig	2023-01-10 20:14:15.630930501 -0600
+@@ -1180,6 +1180,13 @@
+ 	bool
+ 	default n
+ 
++config CGROUP_PALLOC
++	bool "Enable PALLOC"
++	help
++	  Enable PALLOC. PALLOC is a color-aware page-based physical memory
++	  allocator which replaces the buddy allocator for order-zero page
++	  allocations.
++
+ endif # CGROUPS
+ 
+ menuconfig NAMESPACES
+diff -ruN orig_src/kernel/cgroup/cgroup.c new_src/kernel/cgroup/cgroup.c
+--- orig_src/kernel/cgroup/cgroup.c	2023-01-04 10:20:16.473612981 -0600
++++ new_src/kernel/cgroup/cgroup.c	2023-01-10 20:14:32.802173611 -0600
+@@ -5857,10 +5857,12 @@
+ 	RCU_INIT_POINTER(init_task.cgroups, &init_css_set);
+ 
+ 	for_each_subsys(ss, i) {
++#if 0
+ 		WARN(!ss->css_alloc || !ss->css_free || ss->name || ss->id,
+ 		     "invalid cgroup_subsys %d:%s css_alloc=%p css_free=%p id:name=%d:%s\n",
+ 		     i, cgroup_subsys_name[i], ss->css_alloc, ss->css_free,
+ 		     ss->id, ss->name);
++#endif
+ 		WARN(strlen(cgroup_subsys_name[i]) > MAX_CGROUP_TYPE_NAMELEN,
+ 		     "cgroup_subsys_name %s too long\n", cgroup_subsys_name[i]);
+ 
+diff -ruN orig_src/kernel/sched/core.c new_src/kernel/sched/core.c
+--- orig_src/kernel/sched/core.c	2023-01-04 10:20:16.945616403 -0600
++++ new_src/kernel/sched/core.c	2023-01-10 20:12:21.476392834 -0600
+@@ -994,6 +994,31 @@
+ 	raw_spin_rq_unlock_irqrestore(rq, flags);
+ }
+ 
++/*
++ * The purpose of this function is to force rescheduling of a target cpu under
++ * all circumstances. For this reason, this function does not acquire the
++ * target CPU's rq lock and sends a rescheduling interrupt without protection
++ * if need be. It is used exclusively in RT-Gang related code.
++ */
++void resched_cpu_force (int cpu)
++{
++	struct rq *rq = cpu_rq(cpu);
++	struct task_struct *curr = rq->curr;
++
++	cpu = cpu_of(rq);
++
++	if (cpu == smp_processor_id()) {
++		set_tsk_need_resched(curr);
++		set_preempt_need_resched();
++		return;
++	}
++
++	if (set_nr_and_not_polling(curr))
++		smp_send_reschedule(cpu);
++	else
++		trace_sched_wake_idle_without_ipi(cpu);
++}
++
+ #ifdef CONFIG_SMP
+ #ifdef CONFIG_NO_HZ_COMMON
+ /*
+@@ -5630,6 +5655,8 @@
+ 
+ 	for_each_class(class) {
+ 		p = class->pick_next_task(rq);
++		if (p == BLOCK_TASK)
++			continue;
+ 		if (p)
+ 			return p;
+ 	}
+@@ -7729,6 +7756,34 @@
+ 		attr->sched_nice = task_nice(p);
+ }
+ 
++/*
++ * sys_bwlock - Memory bandwidth control lock. Provides exclusive access to
++ * main memory to the holder. Holder must be a real-time task
++ *
++ * @pid	: pid of the process which wants to hold bandwidth lock
++ * @cte : Safe memory usage threshold for corunning tasks
++ */
++SYSCALL_DEFINE2(bwlock, pid_t, pid, int, cte)
++{
++	struct task_struct *p;
++
++	/* Obtain the task structure associated with the process
++	   referenced by pid */
++	if (pid == 0 || current->pid == pid)
++		p = current;
++	else
++		p = find_process_by_pid (pid);
++
++	/* Process does not exist or it is not a real-time process */
++	if (!p || !rt_task (p))
++		return -1;
++
++	p->corun_threshold_events = cte;
++
++	/* Return with success */
++	return 0;
++}
++
+ /**
+  * sys_sched_setscheduler - set/change the scheduler policy and RT priority
+  * @pid: the pid in question.
+diff -ruN orig_src/kernel/sched/features.h new_src/kernel/sched/features.h
+--- orig_src/kernel/sched/features.h	2023-01-04 10:20:17.041617091 -0600
++++ new_src/kernel/sched/features.h	2023-01-10 20:12:45.087641472 -0600
+@@ -7,6 +7,14 @@
+ SCHED_FEAT(GENTLE_FAIR_SLEEPERS, true)
+ 
+ /*
++ * Enable real-time gang scheduling framework (RT-Gang). RT-Gang allows
++ * execution of a single (multi-threaded) real-time task (i.e., gang) at any
++ * giving time across all system cores.
++ * NOTE: This feature is disabled by default.
++ */
++SCHED_FEAT(RT_GANG_LOCK, false)
++
++/*
+  * Place new tasks ahead so that they do not starve already running
+  * tasks
+  */
+diff -ruN orig_src/kernel/sched/rt.c new_src/kernel/sched/rt.c
+--- orig_src/kernel/sched/rt.c	2023-01-04 10:20:17.065617260 -0600
++++ new_src/kernel/sched/rt.c	2023-01-10 20:09:57.073425015 -0600
+@@ -5,13 +5,201 @@
+  */
+ #include "sched.h"
+ 
++#include <linux/debugfs.h>
++#include <linux/uaccess.h>
++
+ #include "pelt.h"
+ 
++/* RT-Gang Definitions */
++rt_gang_lock_t*	rt_glock;
++int core_to_gang[NR_CPUS];
++int be_mem_threshold = SYS_MAX_LLC_EVENTS;
++EXPORT_SYMBOL(be_mem_threshold);
++
++static struct dentry *rtgang_dir;
++
++static ssize_t rtgang_coremap_write(struct file *filp,
++				    const char __user *ubuf,
++				    size_t cnt, loff_t *ppos)
++{
++	int core, map;
++	int BUF_SIZE = 256;
++	char buf[256];
++	char *p = buf;
++	
++	// Only allow core mapping changes when RT-Gang is disabled
++	if(sched_feat(RT_GANG_LOCK))
++	{
++		pr_err("ERR: Core mappings can only be changed under NO_RT_GANG_LOCK\n");
++		return cnt;
++	}
++
++	if (copy_from_user(&buf, ubuf, (cnt > BUF_SIZE) ? BUF_SIZE: cnt) != 0) 
++		return 0;
++	
++	// Get and validate the core and new mapping
++	sscanf(p, "%d %d", &core, &map);
++	if(core < 0 || core >= NR_CPUS)
++	{
++		pr_err("ERR: Core %i is out of bounds\n", core);
++		return cnt;
++	}
++	else if(map < 0 || map >= NR_CPUS)
++	{
++		pr_err("ERR: Mapping given for core %i is out of bounds\n", map);
++		return cnt;
++	}
++	
++	// Only change the mapping if both inputs are valid
++	core_to_gang[core] = map;
++	
++	return cnt;
++}
++
++static int rtgang_coremap_show(struct seq_file *m, void *v)
++{
++	int i;
++	seq_printf(m, "Core to Gang Mappings\n");
++	for(i = 0; i < NR_CPUS; i++)
++	{
++		seq_printf(m, "%i --> %i\n", i, core_to_gang[i]);
++	}
++	return 0;
++}
++
++static int rtgang_coremap_open(struct inode *inode, struct file *filp)
++{
++	return single_open(filp, rtgang_coremap_show, NULL);
++}
++
++static const struct file_operations rtgang_coremap_fops = {
++	.open		= rtgang_coremap_open,
++	.write      = rtgang_coremap_write,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++};
++
++static int rtgang_init_debugfs(void)
++{
++
++	rtgang_dir = debugfs_create_dir("rtgang", NULL);
++	if(!rtgang_dir)
++	{
++		goto fail;
++	}
++	if(!debugfs_create_file("coremap", 0444, rtgang_dir, NULL,
++			    &rtgang_coremap_fops))
++	{
++		goto fail;
++	}
++	return 0;
++	
++fail:
++	debugfs_remove_recursive(rtgang_dir);
++ 	return -ENOMEM;
++}
++
++late_initcall(rtgang_init_debugfs);
++
++/* End of RT-Gang Definitions */
++
+ int sched_rr_timeslice = RR_TIMESLICE;
+ int sysctl_sched_rr_timeslice = (MSEC_PER_SEC / HZ) * RR_TIMESLICE;
+ /* More than 4 hours if BW_SHIFT equals 20. */
+ static const u64 max_rt_runtime = MAX_BW;
+ 
++static inline void gang_lock_cpu(struct task_struct *thread)
++{
++	int cpu = smp_processor_id();
++	int gang = core_to_gang[cpu];
++
++	TRACER(thread, "Adding new gang member");
++	cpumask_set_cpu(cpu, rt_glock[gang].locked_cores);
++	rt_glock[gang].gthreads [cpu] = thread;
++
++	return;
++}
++
++static inline void resched_cpus(cpumask_var_t mask)
++{
++	int cpu;
++	int this_cpu = smp_processor_id();
++
++	for_each_cpu (cpu, mask) {
++		if (cpu == this_cpu)
++			continue;
++
++		resched_cpu_force(cpu);
++	}
++	return;
++}
++
++static inline void do_gang_preemption(void)
++{
++	int cpu;
++	int this_cpu = smp_processor_id();
++	int gang = core_to_gang[this_cpu];
++
++	for_each_cpu (cpu, rt_glock[gang].locked_cores) {
++		WARN_ON(rt_glock[gang].gthreads[cpu] == NULL);
++		TRACER(rt_glock[gang].gthreads[cpu], "Preempting thread");
++
++                set_tsk_need_resched(rt_glock[gang].gthreads[cpu]);
++
++		rt_glock[gang].gthreads[cpu] = NULL;
++		if (cpu != this_cpu)
++			resched_cpu_force(cpu);
++	}
++
++	cpumask_clear(rt_glock[gang].locked_cores);
++
++	return;
++}
++
++static inline void try_glock_release(struct task_struct *thread)
++{
++	int cpu;
++	int this_cpu = smp_processor_id();
++	int gang = core_to_gang[this_cpu];
++
++	WARN_ON(cpumask_weight(rt_glock[gang].locked_cores) == 0);
++
++	/*
++	 * Release RT-Gang lock of 'prev' task on all cores it may have ran on.
++	 * Migrated tasks can hold lock on multiple cores.
++	 */
++	for_each_cpu (cpu, rt_glock[gang].locked_cores) {
++		if (rt_glock[gang].gthreads [cpu] == thread) {
++			TRACER(thread, "Releasing lock");
++			WARN_ON(!rt_prio(thread->prio));
++			cpumask_clear_cpu(cpu, rt_glock[gang].locked_cores);
++		}
++	}
++
++	if (cpumask_weight(rt_glock[gang].locked_cores) == 0) {
++		/* RT-Gang lock is now free. Reschedule blocked cores. */
++		TRACER(thread, "Lock free");
++		rt_glock[gang].prio = INT_MAX;
++		rt_glock[gang].lock_held = false;
++		be_mem_threshold = SYS_MAX_LLC_EVENTS;
++		resched_cpus(rt_glock[gang].blocked_cores);
++		cpumask_clear(rt_glock[gang].blocked_cores);
++	}
++
++	return;
++}
++
++static inline void update_mem_threshold(struct task_struct *thread)
++{
++	if (thread->corun_threshold_events)
++		be_mem_threshold = thread->corun_threshold_events;
++	else
++		be_mem_threshold = SYS_DEFAULT_LLC_EVENTS;
++
++	return;
++}
++
+ static int do_sched_rt_period_timer(struct rt_bandwidth *rt_b, int overrun);
+ 
+ struct rt_bandwidth def_rt_bandwidth;
+@@ -1660,7 +1848,59 @@
+ static struct task_struct *pick_next_task_rt(struct rq *rq)
+ {
+ 	struct task_struct *p = pick_task_rt(rq);
+-
++	
++	if(p == NULL)
++	{
++		return p;
++	}
++	
++	int cpu = smp_processor_id();
++	int gang = core_to_gang[cpu];
++
++	/* Do not apply RT gang to high-priority kernel threads */
++	if (sched_feat(RT_GANG_LOCK) 
++		&& p->mm 
++		&& (p->prio > RT_SYS_PRIO_THRESHOLD))
++	{
++		raw_spin_lock(&rt_glock[gang].lock);
++		if (!rt_glock[gang].lock_held) {
++			/* No RT gang exist currently; begin a new gang */
++			BUG_ON(cpumask_weight(rt_glock[gang].locked_cores) != 0);
++			BUG_ON(cpumask_weight(rt_glock[gang].blocked_cores) != 0);
++
++			TRACER(p, "Acquiring lock");
++			rt_glock[gang].prio = p->prio;
++			gang_lock_cpu(p);
++			rt_glock[gang].lock_held = true;
++			update_mem_threshold(p);
++		} else {
++			BUG_ON(cpumask_weight(rt_glock[gang].locked_cores) == 0);
++			if (rt_glock[gang].prio > p->prio) {
++				/* 'p' has higher priority; preempt */
++				TRACER(p, "Preempted by gang");
++				do_gang_preemption();
++				rt_glock[gang].prio = p->prio;
++				gang_lock_cpu(p);
++				update_mem_threshold(p);
++			} else if (p->prio == rt_glock[gang].prio) {
++				/* 'p' is part of the current RT gang */
++				gang_lock_cpu(p);
++			} else {
++				int this_cpu = smp_processor_id();
++				/* 'p' has lower priority; blocked */
++				if (!cpumask_test_cpu(this_cpu,
++					      rt_glock[gang].blocked_cores)) {
++					TRACER(p, "Blocking gang");
++					cpumask_set_cpu(this_cpu,
++						rt_glock[gang].blocked_cores);
++				}
++				raw_spin_unlock(&rt_glock[gang].lock);
++				return BLOCK_TASK;
++			}
++		}
++		raw_spin_unlock(&rt_glock[gang].lock);
++	}
++ 
+ 	if (p)
+ 		set_next_task_rt(rq, p, true);
+ 
+@@ -1669,8 +1909,20 @@
+ 
+ static void put_prev_task_rt(struct rq *rq, struct task_struct *p)
+ {
++	int cpu = smp_processor_id();
++	int gang = core_to_gang[cpu];
++	
+ 	update_curr_rt(rq);
+ 
++	/* If 'prev' is a member of the current RT gang, update the
++	 * locked_cores mask and release the RT gang lock if necessary. */
++	if (sched_feat(RT_GANG_LOCK))
++	{
++		raw_spin_lock(&rt_glock[gang].lock);
++		if (rt_glock[gang].lock_held)
++			try_glock_release(p);
++		raw_spin_unlock(&rt_glock[gang].lock);
++	}
+ 	update_rt_rq_load_avg(rq_clock_pelt(rq), rq, 1);
+ 
+ 	/*
+@@ -2361,6 +2613,14 @@
+ 		zalloc_cpumask_var_node(&per_cpu(local_cpu_mask, i),
+ 					GFP_KERNEL, cpu_to_node(i));
+ 	}
++	
++	rt_glock = kmalloc(sizeof(rt_gang_lock_t) * NR_CPUS, GFP_KERNEL);
++	for(i = 0; i < NR_CPUS; i++)
++	{
++		core_to_gang[i] = 0;
++	}
++
++	INIT_GANG_LOCK();
+ }
+ #endif /* CONFIG_SMP */
+ 
+diff -ruN orig_src/kernel/sched/sched.h new_src/kernel/sched/sched.h
+--- orig_src/kernel/sched/sched.h	2023-01-04 10:20:17.089617429 -0600
++++ new_src/kernel/sched/sched.h	2023-01-10 20:09:42.253558215 -0600
+@@ -2112,6 +2112,7 @@
+ #endif
+ 
+ #define RETRY_TASK		((void *)-1UL)
++#define BLOCK_TASK		((void *)-2UL)
+ 
+ struct sched_class {
+ 
+@@ -2320,6 +2321,7 @@
+ 
+ extern void resched_curr(struct rq *rq);
+ extern void resched_cpu(int cpu);
++extern void resched_cpu_force(int cpu);
+ 
+ extern struct rt_bandwidth def_rt_bandwidth;
+ extern void init_rt_bandwidth(struct rt_bandwidth *rt_b, u64 period, u64 runtime);
+@@ -3088,3 +3090,59 @@
+ extern void sched_dynamic_update(int mode);
+ #endif
+ 
++/*
++ * GANG SCHEDULING RELATED DECLARATIONS
++ */
++typedef struct rt_gang_lock {
++	raw_spinlock_t		lock;
++	bool			lock_held;
++	cpumask_var_t		locked_cores;
++	cpumask_var_t		blocked_cores;
++	int			prio;
++	struct task_struct*	gthreads [NR_CPUS];
++} rt_gang_lock_t;
++
++extern int be_mem_threshold;
++extern rt_gang_lock_t*	rt_glock;
++extern int core_to_gang[NR_CPUS];
++
++#define RT_SYS_PRIO_THRESHOLD		(50)
++#define INIT_GANG_LOCK()						\
++do {									\
++	int i = 0;							\
++	int j = 0;							\
++	for(; i< NR_CPUS; i++)				\
++	{									\
++		raw_spin_lock_init(&rt_glock[i].lock);				\
++		rt_glock[i].lock_held = false;					\
++		zalloc_cpumask_var(&rt_glock[i].locked_cores, GFP_KERNEL);	\
++		zalloc_cpumask_var(&rt_glock[i].blocked_cores, GFP_KERNEL);	\
++		rt_glock[i].prio = INT_MAX;					\
++		for (; j < NR_CPUS; j++)					\
++			rt_glock[i].gthreads [j] = NULL;				\
++	}									\
++} while (0);
++
++/*
++ * Default memory usage threshold for best-effort tasks. On a system with
++ * 64-Byte cache line size, this equals 100 GBytes/sec i.e., no throttling.
++ */
++#define	SYS_MAX_LLC_EVENTS		(1638400)
++
++/*
++ * The following budget (for using main memory) is applied by default to all
++ * best-effort tasks on a per-core basis while a real-time task is executing.
++ * On a system with 64-Byte cache line size, the value specified below comes
++ * out to be 100 MBytes/sec.
++ * The goal here is to throttle 'aggressively' by default so that the
++ * best-effort tasks are not able to interfere with the real-time tasks.
++ */
++#define	SYS_DEFAULT_LLC_EVENTS		(1638)
++
++#define RT_GANG_DEBUG
++#ifdef RT_GANG_DEBUG
++#define TRACER(task, msg)		trace_printk("[G:] %s\n", msg)
++#else
++#define TRACER(task, msg)
++#endif
++
+diff -ruN orig_src/mm/Makefile new_src/mm/Makefile
+--- orig_src/mm/Makefile	2023-01-04 10:20:18.661628371 -0600
++++ new_src/mm/Makefile	2023-01-10 20:14:42.161776690 -0600
+@@ -109,6 +109,7 @@
+ obj-$(CONFIG_ZSMALLOC)	+= zsmalloc.o
+ obj-$(CONFIG_Z3FOLD)	+= z3fold.o
+ obj-$(CONFIG_GENERIC_EARLY_IOREMAP) += early_ioremap.o
++obj-$(CONFIG_CGROUP_PALLOC) += palloc.o
+ obj-$(CONFIG_CMA)	+= cma.o
+ obj-$(CONFIG_MEMORY_BALLOON) += balloon_compaction.o
+ obj-$(CONFIG_PAGE_EXTENSION) += page_ext.o
+diff -ruN orig_src/mm/page_alloc.c new_src/mm/page_alloc.c
+--- orig_src/mm/page_alloc.c	2023-01-04 10:20:19.121631495 -0600
++++ new_src/mm/page_alloc.c	2023-01-10 20:01:24.154379959 -0600
+@@ -73,6 +73,7 @@
+ #include <linux/khugepaged.h>
+ #include <linux/buffer_head.h>
+ #include <asm/sections.h>
++#include <linux/debugfs.h>
+ #include <asm/tlbflush.h>
+ #include <asm/div64.h>
+ #include "internal.h"
+@@ -120,6 +121,191 @@
+ 
+ /* prevent >1 _updater_ of zone percpu pageset ->high and ->batch fields */
+ static DEFINE_MUTEX(pcp_batch_high_lock);
++
++#ifdef CONFIG_CGROUP_PALLOC
++#include <linux/palloc.h>
++
++int memdbg_enable = 0;
++EXPORT_SYMBOL(memdbg_enable);
++
++static int sysctl_alloc_balance = 0;
++
++/* PALLOC address bitmask */
++static unsigned long sysctl_palloc_mask = 0x0;
++
++static int mc_xor_bits[64];
++static int use_mc_xor = 0;
++static int use_palloc = 0;
++
++DEFINE_PER_CPU(unsigned long, palloc_rand_seed);
++
++#define memdbg(lvl, fmt, ...)						\
++	do {								\
++		if(memdbg_enable >= lvl)				\
++			trace_printk(fmt, ##__VA_ARGS__);		\
++	} while(0)
++
++struct palloc_stat {
++	s64 max_ns;
++	s64 min_ns;
++	s64 tot_ns;
++
++	s64 tot_cnt;
++	s64 iter_cnt;			/* avg_iter = iter_cnt / tot_cnt */
++
++	s64 cache_hit_cnt;		/* hit_rate = cache_hit_cnt / cache_acc_cnt */
++	s64 cache_acc_cnt;
++
++	s64 flush_cnt;
++
++	s64 alloc_balance;
++	s64 alloc_balance_timeout;
++	ktime_t start;			/* Start time of the current iteration */
++};
++
++static struct {
++	u32 enabled;
++	int colors;
++	struct palloc_stat stat[3]; 	/* 0 - color, 1 - normal, 2- fail */
++} palloc;
++
++static void palloc_flush(struct zone *zone);
++
++static ssize_t palloc_write(struct file *filp, const char __user *ubuf, size_t cnt, loff_t *ppos)
++{
++	char buf[64];
++	int i;
++
++	if (cnt > 63) cnt = 63;
++	if (copy_from_user(&buf, ubuf, cnt))
++		return -EFAULT;
++
++	if (!strncmp(buf, "reset", 5)) {
++		printk(KERN_INFO "reset statistics...\n");
++		for (i = 0; i < ARRAY_SIZE(palloc.stat); i++) {
++			memset(&palloc.stat[i], 0, sizeof(struct palloc_stat));
++			palloc.stat[i].min_ns = 0x7fffffff;
++		}
++	} else if (!strncmp(buf, "flush", 5)) {
++		struct zone *zone;
++		printk(KERN_INFO "flush color cache...\n");
++		for_each_populated_zone(zone) {
++			unsigned long flags;
++			if (!zone)
++				continue;
++			spin_lock_irqsave(&zone->lock, flags);
++			palloc_flush(zone);
++			spin_unlock_irqrestore(&zone->lock, flags);
++		}
++	} else if (!strncmp(buf, "xor", 3)) {
++		int bit, xor_bit;
++		sscanf(buf + 4, "%d %d", &bit, &xor_bit);
++		if ((bit > 0 && bit < 64) && (xor_bit > 0 && xor_bit < 64) && bit != xor_bit) {
++			mc_xor_bits[bit] = xor_bit;
++		}
++	}
++
++	*ppos += cnt;
++
++	return cnt;
++}
++
++static int palloc_show(struct seq_file *m, void *v)
++{
++	int i, tmp;
++	char *desc[] = { "Color", "Normal", "Fail" };
++	char buf[256];
++
++	for (i = 0; i < 3; i++) {
++		struct palloc_stat *stat = &palloc.stat[i];
++		seq_printf(m, "statistics %s:\n", desc[i]);
++		seq_printf(m, " min(ns)/max(ns)/avg(ns)/tot_cnt: %lld %lld %lld %lld\n",
++			   stat->min_ns,
++			   stat->max_ns,
++			   (stat->tot_cnt)? div64_u64(stat->tot_ns, stat->tot_cnt) : 0,
++			   stat->tot_cnt);
++		seq_printf(m, " hit rate: %lld/%lld (%lld %%)\n",
++			   stat->cache_hit_cnt, stat->cache_acc_cnt,
++			   (stat->cache_acc_cnt)? div64_u64(stat->cache_hit_cnt*100, stat->cache_acc_cnt) : 0);
++		seq_printf(m, " avg iter: %lld (%lld/%lld)\n",
++			   (stat->tot_cnt)? div64_u64(stat->iter_cnt, stat->tot_cnt) : 0,
++			   stat->iter_cnt, stat->tot_cnt);
++		seq_printf(m, " flush cnt: %lld\n", stat->flush_cnt);
++
++		seq_printf(m, " balance: %lld | fail: %lld\n",
++			   stat->alloc_balance, stat->alloc_balance_timeout);
++	}
++
++	seq_printf(m, "mask: 0x%lx\n", sysctl_palloc_mask);
++
++	tmp = bitmap_weight(&sysctl_palloc_mask, sizeof(unsigned long)*8);
++
++	seq_printf(m, "weight: %d (bins: %d)\n", tmp, (1 << tmp));
++
++	scnprintf(buf, 256, "%*pbl", (int)(sizeof(unsigned long) * 8), &sysctl_palloc_mask);
++
++	seq_printf(m, "bits: %s\n", buf);
++
++	seq_printf(m, "XOR bits: %s\n", (use_mc_xor)? "enabled" : "disabled");
++
++	for (i = 0; i < 64; i++) {
++		if (mc_xor_bits[i] > 0)
++			seq_printf(m, "    %3d <-> %3d\n", i, mc_xor_bits[i]);
++	}
++
++	seq_printf(m, "Use PALLOC: %s\n", (use_palloc)? "enabled" : "disabled");
++
++	return 0;
++}
++
++static int palloc_open(struct inode *inode, struct file *filp)
++{
++	return single_open(filp, palloc_show, NULL);
++}
++
++static const struct file_operations palloc_fops = {
++	.open		= palloc_open,
++	.write		= palloc_write,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++};
++
++static int __init palloc_debugfs(void)
++{
++	umode_t mode = S_IFREG | S_IRUSR | S_IWUSR;
++	struct dentry *dir;
++	int i;
++
++	dir = debugfs_create_dir("palloc", NULL);
++
++	/* Statistics Initialization */
++	for (i = 0; i < ARRAY_SIZE(palloc.stat); i++) {
++		memset(&palloc.stat[i], 0, sizeof(struct palloc_stat));
++		palloc.stat[i].min_ns = 0x7fffffff;
++	}
++
++	if (!dir)
++		return PTR_ERR(dir);
++	if (!debugfs_create_file("control", mode, dir, NULL, &palloc_fops))
++		goto fail;
++	debugfs_create_u64("palloc_mask", mode, dir, (u64 *)&sysctl_palloc_mask);
++	debugfs_create_u32("use_mc_xor", mode, dir, &use_mc_xor);
++	debugfs_create_u32("use_palloc", mode, dir, &use_palloc);
++	debugfs_create_u32("debug_level", mode, dir, &memdbg_enable);
++	debugfs_create_u32("alloc_balance", mode, dir, &sysctl_alloc_balance);
++
++	return 0;
++
++fail:
++	debugfs_remove_recursive(dir);
++	return -ENOMEM;
++}
++
++late_initcall(palloc_debugfs);
++
++#endif /* CONFIG_CGROUP_PALLOC */
++
+ #define MIN_PERCPU_PAGELIST_HIGH_FRACTION (8)
+ 
+ struct pagesets {
+@@ -2461,6 +2647,338 @@
+ 		clear_page_pfmemalloc(page);
+ }
+ 
++#ifdef CONFIG_CGROUP_PALLOC
++
++int palloc_bins(void)
++{
++	return min((1 << bitmap_weight(&sysctl_palloc_mask, sizeof(unsigned long) * 8)), MAX_PALLOC_BINS);
++}
++
++static inline int page_to_color(struct page *page)
++{
++	int color = 0;
++	int idx = 0;
++	int c;
++
++	unsigned long paddr = page_to_phys(page);
++	for_each_set_bit(c, &sysctl_palloc_mask, sizeof(unsigned long) * 8) {
++		if (use_mc_xor) {
++			if (((paddr >> c) & 0x1) ^ ((paddr >> mc_xor_bits[c]) & 0x1))
++				color |= (1 << idx);
++		} else {
++			if ((paddr >> c) & 0x1)
++				color |= (1 << idx);
++		}
++
++		idx++;
++	}
++
++	return color;
++}
++
++/* Debug */
++static inline unsigned long list_count(struct list_head *head)
++{
++	unsigned long n = 0;
++	struct list_head *curr;
++
++	list_for_each(curr, head)
++		n++;
++
++	return n;
++}
++
++/* Move all color_list pages into free_area[0].freelist[2]
++ * zone->lock must be held before calling this function
++ */
++static void palloc_flush(struct zone *zone)
++{
++	int c;
++	struct page *page;
++
++	memdbg(2, "Flush the color-cache for zone %s\n", zone->name);
++
++	while(1) {
++		for (c = 0; c < MAX_PALLOC_BINS; c++) {
++			if (!list_empty(&zone->color_list[c])) {
++				page = list_entry(zone->color_list[c].next, struct page, lru);
++				list_del_init(&page->lru);
++				__free_one_page(page, page_to_pfn(page), zone, 0, get_pageblock_migratetype(page), FPI_NONE);
++				zone->free_area[0].nr_free--;
++			}
++
++			if (list_empty(&zone->color_list[c])) {
++				bitmap_clear(zone->color_bitmap, c, 1);
++				INIT_LIST_HEAD(&zone->color_list[c]);
++			}
++		}
++
++		if (bitmap_weight(zone->color_bitmap, MAX_PALLOC_BINS) == 0)
++			break;
++	}
++}
++
++
++static inline void rmv_page_order(struct page *page)
++{
++	__ClearPageBuddy(page);
++	set_page_private(page, 0);
++}
++
++/* Move a page (size = 1 << order) into order-0 colored cache */
++static void palloc_insert(struct zone *zone, struct page *page, int order)
++{
++	int i, color;
++
++	/* 1 page (2^order) -> 2^order x pages of colored cache.
++	   Remove from zone->free_area[order].free_list[mt] */
++	list_del(&page->lru);
++	zone->free_area[order].nr_free--;
++
++	/* Insert pages to zone->color_list[] (all order-0) */
++	for (i = 0; i < (1 << order); i++) {
++		color = page_to_color(&page[i]);
++
++		/* Add to zone->color_list[color] */
++		memdbg(5, "- Add pfn %ld (0x%08llx) to color_list[%d]\n", page_to_pfn(&page[i]), (u64)page_to_phys(&page[i]), color);
++
++		INIT_LIST_HEAD(&page[i].lru);
++		list_add_tail(&page[i].lru, &zone->color_list[color]);
++		bitmap_set(zone->color_bitmap, color, 1);
++		zone->free_area[0].nr_free++;
++		rmv_page_order(&page[i]);
++	}
++
++	memdbg(4, "Add order=%d zone=%s\n", order, zone->name);
++
++	return;
++}
++
++/* Return a colored page (order-0) and remove it from the colored cache */
++static inline struct page *palloc_find_cmap(struct zone *zone, COLOR_BITMAP(cmap), int order, struct palloc_stat *stat)
++{
++	struct page *page;
++	COLOR_BITMAP(tmpmask);
++	int c;
++	unsigned int tmp_idx;
++	int found_w, want_w;
++	unsigned long rand_seed;
++
++	/* Cache Statistics */
++	if (stat) stat->cache_acc_cnt++;
++
++	/* Find color cache entry */
++	if (!bitmap_intersects(zone->color_bitmap, cmap, MAX_PALLOC_BINS))
++		return NULL;
++
++	bitmap_and(tmpmask, zone->color_bitmap, cmap, MAX_PALLOC_BINS);
++
++	/* Must have a balance */
++	found_w = bitmap_weight(tmpmask, MAX_PALLOC_BINS);
++	want_w  = bitmap_weight(cmap, MAX_PALLOC_BINS);
++
++	if (sysctl_alloc_balance && (found_w < want_w) && (found_w < min(sysctl_alloc_balance, want_w)) && memdbg_enable) {
++		ktime_t dur = ktime_sub(ktime_get(), stat->start);
++		if (dur < 1000000) {
++			/* Try to balance unless order = MAX-2 or 1ms has passed */
++			memdbg(4, "found_w=%d want_w=%d order=%d elapsed=%lld ns\n", found_w, want_w, order, dur);
++
++			stat->alloc_balance++;
++
++			return NULL;
++		}
++
++		stat->alloc_balance_timeout++;
++	}
++
++	/* Choose a bit among the candidates */
++	if (sysctl_alloc_balance && memdbg_enable) {
++		rand_seed = (unsigned long)stat->start;
++	} else {
++		rand_seed = per_cpu(palloc_rand_seed, smp_processor_id())++;
++
++		if (rand_seed > MAX_PALLOC_BINS)
++			per_cpu(palloc_rand_seed, smp_processor_id()) = 0;
++	}
++
++	tmp_idx = rand_seed % found_w;
++
++	for_each_set_bit(c, tmpmask, MAX_PALLOC_BINS) {
++		if (tmp_idx-- <= 0)
++			break;
++	}
++
++	BUG_ON(c >= MAX_PALLOC_BINS);
++	BUG_ON(list_empty(&zone->color_list[c]));
++
++	page = list_entry(zone->color_list[c].next, struct page, lru);
++
++	memdbg(1, "Found colored page pfn %ld color %d seed %ld found/want %d/%d\n",
++	       page_to_pfn(page), c, rand_seed, found_w, want_w);
++
++	/* Remove the page from the zone->color_list[color] */
++	list_del(&page->lru);
++
++	if (list_empty(&zone->color_list[c]))
++		bitmap_clear(zone->color_bitmap, c, 1);
++
++	zone->free_area[0].nr_free--;
++
++	memdbg(5, "- del pfn %ld from color_list[%d]\n", page_to_pfn(page), c);
++
++	if (stat) stat->cache_hit_cnt++;
++
++	return page;
++}
++
++static inline void update_stat(struct palloc_stat *stat, struct page *page, int iters)
++{
++	ktime_t dur;
++
++	if (memdbg_enable == 0)
++		return;
++
++	dur = ktime_sub(ktime_get(), stat->start);
++
++	if (dur > 0) {
++		stat->min_ns = min(dur, stat->min_ns);
++		stat->max_ns = max(dur, stat->max_ns);
++
++		stat->tot_ns += dur;
++		stat->iter_cnt += iters;
++
++		stat->tot_cnt++;
++
++		memdbg(2, "order %ld pfn %ld (0x%08llx) color %d iters %d in %lld ns\n",
++		       (long int)buddy_order(page), (long int)page_to_pfn(page), (u64)page_to_phys(page),
++		       (int)page_to_color(page), iters, dur);
++	} else {
++		memdbg(5, "dur %lld is < 0\n", dur);
++	}
++
++	return;
++}
++
++/*
++ * Go through the free lists for the given migratetype and remove
++ * the smallest available page from the freelists
++ */
++static inline
++struct page *__rmqueue_smallest(struct zone *zone, unsigned int order,
++						int migratetype)
++{
++	unsigned int current_order;
++	struct free_area *area;
++	struct list_head *curr, *tmp;
++	struct page *page;
++
++	struct palloc *ph;
++	struct palloc_stat *c_stat = &palloc.stat[0];
++	struct palloc_stat *n_stat = &palloc.stat[1];
++	struct palloc_stat *f_stat = &palloc.stat[2];
++
++	int iters = 0;
++	COLOR_BITMAP(tmpcmap);
++	unsigned long *cmap;
++
++	if (memdbg_enable)
++		c_stat->start = n_stat->start = f_stat->start = ktime_get();
++
++	if (!use_palloc)
++		goto normal_buddy_alloc;
++
++	/* cgroup information */
++	ph = ph_from_subsys(current->cgroups->subsys[palloc_cgrp_id]);
++
++	if (ph && bitmap_weight(ph->cmap, MAX_PALLOC_BINS) > 0)
++		cmap = ph->cmap;
++	else {
++		bitmap_fill(tmpcmap, MAX_PALLOC_BINS);
++		cmap = tmpcmap;
++	}
++
++	page = NULL;
++	if (order == 0) {
++		/* Find page in the color cache */
++		memdbg(5, "check color cache (mt=%d)\n", migratetype);
++
++		page = palloc_find_cmap(zone, cmap, 0, c_stat);
++
++		if (page) {
++			update_stat(c_stat, page, iters);
++			return page;
++		}
++	}
++
++	if (order == 0) {
++		/* Build Color Cache */
++		iters++;
++
++		/* Search the entire list. Make color cache in the process */
++		for (current_order = 0; current_order < MAX_ORDER; ++current_order) {
++			area = &(zone->free_area[current_order]);
++
++			if (list_empty(&area->free_list[migratetype]))
++				continue;
++
++			memdbg(3, " order=%d (nr_free=%ld)\n", current_order, area->nr_free);
++
++			list_for_each_safe(curr, tmp, &area->free_list[migratetype]) {
++				iters++;
++				page = list_entry(curr, struct page, lru);
++				palloc_insert(zone, page, current_order);
++				page = palloc_find_cmap(zone, cmap, current_order, c_stat);
++
++				if (page) {
++					update_stat(c_stat, page, iters);
++					memdbg(1, "Found at Zone %s pfn 0x%lx\n", zone->name, page_to_pfn(page));
++
++					return page;
++				}
++			}
++		}
++
++		memdbg(1, "Failed to find a matching color\n");
++	} else {
++normal_buddy_alloc:
++		/* Normal Buddy Algorithm */
++		/* Find a page of the specified size in the preferred list */
++		for (current_order = order; current_order < MAX_ORDER; ++current_order) {
++			area = &(zone->free_area[current_order]);
++			iters++;
++
++/*			if (list_empty(&area->free_list[migratetype]))
++				continue;
++
++			page = list_entry(area->free_list[migratetype].next, struct page, lru);
++
++			list_del(&page->lru);
++			rmv_page_order(page);
++			area->nr_free--;
++			expand(zone, page, order, current_order, area, migratetype);
++*/
++	
++			page = get_page_from_free_area(area, migratetype);
++			if (!page)
++				continue;
++			del_page_from_free_list(page, zone, current_order);
++			expand(zone, page, order, current_order, migratetype);
++			set_pcppage_migratetype(page, migratetype);
++
++			update_stat(n_stat, page, iters);
++
++			return page;
++		}
++	}
++
++	/* No memory (colored or normal) found in this zone */
++	memdbg(1, "No memory in Zone %s: order %d mt %d\n", zone->name, order, migratetype);
++
++	return NULL;
++}
++
++#else /* CONFIG_CGROUP_PALLOC */
++
+ /*
+  * Go through the free lists for the given migratetype and remove
+  * the smallest available page from the freelists
+@@ -2488,6 +3006,7 @@
+ 	return NULL;
+ }
+ 
++#endif /* CONFIG_CGROUP_PALLOC */
+ 
+ /*
+  * This array describes the order lists are fallen back to when
+@@ -3701,8 +4220,16 @@
+ {
+ 	unsigned long flags;
+ 	struct page *page;
++	struct palloc *ph;
+ 
++#ifdef CONFIG_CGROUP_PALLOC
++	ph = ph_from_subsys(current->cgroups->subsys[palloc_cgrp_id]);
++ 	/* Skip PCP when physical memory aware allocation is requested */
++	if (likely(pcp_allowed_order(order)) && !ph) {
++#else
+ 	if (likely(pcp_allowed_order(order))) {
++
++#endif
+ 		/*
+ 		 * MIGRATE_MOVABLE pcplist could have the pages on CMA area and
+ 		 * we need to skip it when CMA area isn't allowed.
+@@ -6700,6 +7227,17 @@
+ static void __meminit zone_init_free_lists(struct zone *zone)
+ {
+ 	unsigned int order, t;
++	
++#ifdef CONFIG_CGROUP_PALLOC
++	int c;
++
++	for (c = 0; c < MAX_PALLOC_BINS; c++) {
++		INIT_LIST_HEAD(&zone->color_list[c]);
++	}
++
++	bitmap_zero(zone->color_bitmap, MAX_PALLOC_BINS);
++#endif /* CONFIG_CGROUP_PALLOC */
++	
+ 	for_each_migratetype_order(order, t) {
+ 		INIT_LIST_HEAD(&zone->free_area[order].free_list[t]);
+ 		zone->free_area[order].nr_free = 0;
+@@ -9408,6 +9946,11 @@
+ 	offline_mem_sections(pfn, end_pfn);
+ 	zone = page_zone(pfn_to_page(pfn));
+ 	spin_lock_irqsave(&zone->lock, flags);
++	
++#ifdef CONFIG_CGROUP_PALLOC
++	palloc_flush(zone);
++#endif
++
+ 	while (pfn < end_pfn) {
+ 		page = pfn_to_page(pfn);
+ 		/*
+diff -ruN orig_src/mm/palloc.c new_src/mm/palloc.c
+--- orig_src/mm/palloc.c	1969-12-31 18:00:00.000000000 -0600
++++ new_src/mm/palloc.c	2023-01-10 20:15:03.292918744 -0600
+@@ -0,0 +1,173 @@
++/**
++ * kernel/palloc.c
++ *
++ * Color Aware Physical Memory Allocator User-Space Information
++ *
++ */
++
++#include <linux/types.h>
++#include <linux/cgroup.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/palloc.h>
++#include <linux/mm.h>
++#include <linux/err.h>
++#include <linux/fs.h>
++#include <linux/bitmap.h>
++#include <linux/module.h>
++
++/**
++ * Check if a page is compliant with the policy defined for the given vma
++ */
++#ifdef CONFIG_CGROUP_PALLOC
++
++#define MAX_LINE_LEN (6 * 128)
++
++/**
++ * Type of files in a palloc group
++ * FILE_PALLOC - contains list of palloc bins allowed
++ */
++typedef enum {
++	FILE_PALLOC,
++} palloc_filetype_t;
++
++/**
++ * Retrieve the palloc group corresponding to this cgroup container
++ */
++struct palloc *cgroup_ph(struct cgroup *cgrp)
++{
++	return container_of(cgrp->subsys[palloc_cgrp_id], struct palloc, css);
++}
++
++struct palloc *ph_from_subsys(struct cgroup_subsys_state *subsys)
++{
++	return container_of(subsys, struct palloc, css);
++}
++
++/**
++ * Common write function for files in palloc cgroup
++ */
++static int update_bitmask(unsigned long *bitmap, const char *buf, int maxbits)
++{
++	int retval = 0;
++
++	if (!*buf)
++		bitmap_clear(bitmap, 0, maxbits);
++	else
++		retval = bitmap_parselist(buf, bitmap, maxbits);
++
++	return retval;
++}
++
++static ssize_t palloc_file_write(struct kernfs_open_file *of, char *buf, size_t nbytes, loff_t off)
++{
++	struct cgroup_subsys_state *css;
++	struct cftype *cft;
++	int retval = 0;
++	struct palloc *ph;
++
++	css = of_css(of);
++	cft = of_cft(of);
++	ph = container_of(css, struct palloc, css);
++
++	switch (cft->private) {
++		case FILE_PALLOC:
++			retval = update_bitmask(ph->cmap, buf, palloc_bins());
++			printk(KERN_INFO "Bins : %s\n", buf);
++			break;
++
++		default:
++			retval = -EINVAL;
++			break;
++	}
++
++	return retval? :nbytes;
++}
++
++static int palloc_file_read(struct seq_file *sf, void *v)
++{
++	struct cgroup_subsys_state *css = seq_css(sf);
++	struct cftype *cft = seq_cft(sf);
++	struct palloc *ph = container_of(css, struct palloc, css);
++	char *page;
++	ssize_t retval = 0;
++	char *s;
++
++	if (!(page = (char *)__get_free_page( __GFP_ZERO)))
++		return -ENOMEM;
++
++	s = page;
++
++	switch (cft->private) {
++		case FILE_PALLOC:
++			s += scnprintf(s, PAGE_SIZE, "%*pbl", (int)palloc_bins(), ph->cmap);
++			*s++ = '\n';
++			printk(KERN_INFO "Bins : %s", page);
++			break;
++
++		default:
++			retval = -EINVAL;
++			goto out;
++	}
++
++	seq_printf(sf, "%s", page);
++
++out:
++	free_page((unsigned long)page);
++	return retval;
++}
++
++/**
++ * struct cftype : handler definitions for cgroup control files
++ *
++ * for the common functions, 'private' gives the type of the file
++ */
++static struct cftype files[] = {
++	{
++		.name 		= "bins",
++		.seq_show	= palloc_file_read,
++		.write		= palloc_file_write,
++		.max_write_len	= MAX_LINE_LEN,
++		.private	= FILE_PALLOC,
++	},
++	{}
++};
++
++
++/**
++ * palloc_create - create a palloc group
++ */
++static struct cgroup_subsys_state *palloc_create(struct cgroup_subsys_state *css)
++{
++	struct palloc *ph_child;
++
++	ph_child = kmalloc(sizeof(struct palloc), GFP_KERNEL);
++
++	if (!ph_child)
++		return ERR_PTR(-ENOMEM);
++
++	bitmap_clear(ph_child->cmap, 0, MAX_PALLOC_BINS);
++
++	return &ph_child->css;
++}
++
++/**
++ * Destroy an existing palloc group
++ */
++static void palloc_destroy(struct cgroup_subsys_state *css)
++{
++	struct palloc *ph = container_of(css, struct palloc, css);
++
++	kfree(ph);
++}
++
++struct cgroup_subsys palloc_cgrp_subsys = {
++	.name		= "palloc",
++	.css_alloc	= palloc_create,
++	.css_free	= palloc_destroy,
++	.id		= palloc_cgrp_id,
++	.dfl_cftypes	= files,
++	.legacy_cftypes	= files,
++};
++
++#endif /* CONFIG_CGROUP_PALLOC */
+diff -ruN orig_src/mm/vmstat.c new_src/mm/vmstat.c
+--- orig_src/mm/vmstat.c	2023-01-04 10:20:19.389633275 -0600
++++ new_src/mm/vmstat.c	2023-01-10 20:15:13.660516151 -0600
+@@ -29,6 +29,10 @@
+ #include <linux/page_ext.h>
+ #include <linux/page_owner.h>
+ 
++#ifdef CONFIG_CGROUP_PALLOC
++#include <linux/palloc.h>
++#endif
++
+ #include "internal.h"
+ 
+ #ifdef CONFIG_NUMA
+@@ -1443,6 +1447,44 @@
+ {
+ 	int order;
+ 
++#ifdef CONFIG_CGROUP_PALLOC
++	int color, mt, cnt, bins;
++	struct free_area *area;
++	struct list_head *curr;
++
++	seq_printf(m, "--------\n");
++
++	/* Order by memory type */
++	for (mt = 0; mt < MIGRATE_TYPES; mt++) {
++		seq_printf(m, "-%17s[%d]", "mt", mt);
++		for (order = 0; order < MAX_ORDER; order++) {
++			area = &(zone->free_area[order]);
++			cnt  = 0;
++
++			list_for_each(curr, &area->free_list[mt])
++				cnt++;
++
++			seq_printf(m, "%6d ", cnt);
++		}
++
++		seq_printf(m, "\n");
++	}
++
++	/* Order by color */
++	seq_printf(m, "--------\n");
++	bins = palloc_bins();
++
++	for (color = 0; color < bins; color++) {
++		seq_printf(m, "- color [%d:%0x]", color, color);
++		cnt = 0;
++
++		list_for_each(curr, &zone->color_list[color])
++			cnt++;
++
++		seq_printf(m, "%6d\n", cnt);
++	}
++#endif /* CONFIG_CGROUP_PALLOC */
++
+ 	seq_printf(m, "Node %d, zone %8s ", pgdat->node_id, zone->name);
+ 	for (order = 0; order < MAX_ORDER; ++order)
+ 		seq_printf(m, "%6lu ", zone->free_area[order].nr_free);
